@@ -1,0 +1,78 @@
+name: Retrain Pipeline
+
+on:
+  schedule:
+    - cron: "0 2 * * *"   # nightly at 02:00 UTC
+  workflow_dispatch:        # manual trigger from GitHub UI
+    inputs:
+      optuna_trials:
+        description: "Number of Optuna hyperparameter trials"
+        required: false
+        default: "50"
+      data_source:
+        description: "Data source (primary / fallback / openml)"
+        required: false
+        default: "primary"
+
+jobs:
+  retrain:
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ── Step 1 : Ingest latest data ────────────────────────────────────
+      - name: Ingest data
+        env:
+          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+        run: |
+          python -m src.ingest.ingest \
+            --source ${{ github.event.inputs.data_source || 'primary' }}
+
+      # ── Step 2 : Feature engineering ──────────────────────────────────
+      - name: Feature engineering
+        env:
+          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+        run: python -m src.features.engineer
+
+      # ── Step 3 : Train & auto-promote ─────────────────────────────────
+      - name: Train model
+        env:
+          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+        run: |
+          python -m src.train.train \
+            --trials ${{ github.event.inputs.optuna_trials || '50' }}
+
+      # ── Step 4 : Trigger deploy if model was promoted ──────────────────
+      - name: Check promotion & trigger deploy
+        env:
+          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python - <<'EOF'
+          import mlflow, sys
+          from mlflow.tracking import MlflowClient
+          import os, subprocess
+
+          mlflow.set_tracking_uri(os.environ["MLFLOW_TRACKING_URI"])
+          client = MlflowClient()
+          staging = client.get_latest_versions("house-price-predictor", stages=["Staging"])
+          if staging:
+              print(f"New Staging model v{staging[0].version} — triggering deploy workflow")
+              subprocess.run([
+                  "gh", "workflow", "run", "deploy.yml",
+                  "--field", f"model_version={staging[0].version}"
+              ], check=True)
+          else:
+              print("No new Staging model — skipping deploy")
+          EOF
